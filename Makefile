@@ -24,4 +24,10 @@ install:
 		$(DESTDIR)$(bindir)
 	chmod +x $(DESTDIR)$(bindir)/$(firstword $(FILES))
 
-clean:
+clean distclean:
+
+testinstall:
+	$(eval TMP := $(shell mktemp -d))
+	$(MAKE) DESTDIR=$(TMP) install
+	(cd $(TMP) && ./dbus-modbus-client.py --help > /dev/null)
+	-rm -rf $(TMP)
