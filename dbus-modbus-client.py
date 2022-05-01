@@ -24,6 +24,7 @@ import watchdog
 
 import carlo_gavazzi
 import dse
+import Eastron_SDM72D
 import ev_charger
 import smappee
 import abb
