@@ -1,6 +1,6 @@
 # VenusOS module for support of Eastron SDM72D-Modbus v2
 # might work also with other Eastron devices > Product code on 0xfc02 (type u16b) to be added into models overview
-# 
+#
 # Community contribution by Thomas Weichenberger
 # Version 1.4 - 2022-02-13
 #
@@ -29,6 +29,8 @@ phase_configs = [
 ]
 
 class Eastron_SDM72Dv2(device.EnergyMeter):
+    vendor_id = 'ea'
+    vendor_name = 'Eastron'
     productid = 0xb023 # id assigned by Victron Support
     productname = 'Eastron SDM72Dv2'
     min_timeout = 0.5
@@ -37,10 +39,10 @@ class Eastron_SDM72Dv2(device.EnergyMeter):
         super(Eastron_SDM72Dv2, self).__init__(*args)
 
         self.info_regs = [
-            Reg_u16(0xfc02, '/HardwareVersion'),
-            Reg_u16(0xfc03, '/FirmwareVersion'),
-            Reg_f32b(0x000a, '/PhaseConfig', text=phase_configs, write=(0, 3)),
-            Reg_u32b(0x0014, '/Serial'),
+            Reg_u16(0xfc02, '/HardwareVersion', access="holding"),
+            Reg_u16(0xfc03, '/FirmwareVersion', access="holding"),
+            Reg_f32b(0x000a, '/PhaseConfig', text=phase_configs, write=(0, 3), access="holding"),
+            Reg_u32b(0x0014, '/Serial', access="holding"),
         ]
 
     def phase_regs(self, n):
@@ -72,10 +74,6 @@ class Eastron_SDM72Dv2(device.EnergyMeter):
 
         self.data_regs = regs
 
-    def get_ident(self):
-        return 'cg_%s' % self.info['/Serial']
-
-
 
 # identifier to be checked, if register identical on all SDM630 (only first 16 bytes in u16b of 32 bit register 0xfc02)
 models = {
@@ -89,7 +87,7 @@ models = {
     },
 }
 
-probe.add_handler(probe.ModelRegister(Reg_u16(0xfc02), models,
+probe.add_handler(probe.ModelRegister(Reg_u16(0xfc02, access="holding"), models,
                                       methods=['tcp','rtu'],
                                       rates=[1200,2400,4800,9600,19200],
                                       units=[1]))
