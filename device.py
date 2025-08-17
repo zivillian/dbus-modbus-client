@@ -1,4 +1,3 @@
-from copy import copy
 import dbus
 from functools import partial
 import logging
@@ -13,13 +12,14 @@ import __main__
 from register import Reg
 from utils import *
 
-def pack_regs(method, regs):
-    rr = []
-    for r in regs:
-        rr += r if isinstance(r, list) else [r]
-    rr.sort(key=lambda r: r.base)
+class RegList(list):
+    def __init__(self, access=None, regs=[]):
+        super().__init__(regs)
+        self.access = access
 
+def modbus_overhead(method):
     overhead = 5 + 2                # request + response
+
     if method == 'tcp':
         overhead += 2 * (20 + 7)    # TCP + MBAP
     elif method == 'udp':
@@ -27,15 +27,24 @@ def pack_regs(method, regs):
     elif method == 'rtu':
         overhead += 2 * (1 + 2)     # address + crc
 
+    return overhead
+
+def contains_any(a, b, x):
+    return any(a <= xx <= b for xx in x) if x else False
+
+def pack_list(rr, access, hole_max, barrier):
+    rr.sort(key=lambda r: r.base)
+
     regs = []
-    rg = [rr.pop(0)]
+    rg = RegList(access, [rr.pop(0)])
 
     for r in rr:
         end = rg[-1].base + rg[-1].count
         nr = r.base + r.count - rg[0].base
-        if nr > 125 or 2 * (r.base - end) > overhead:
+        if nr > 125 or (r.base - end) > hole_max or \
+           contains_any(end, r.base, barrier):
             regs.append(rg)
-            rg = []
+            rg = RegList()
 
         rg.append(r)
 
@@ -45,12 +54,18 @@ def pack_regs(method, regs):
     return regs
 
 class BaseDevice:
+    vendor_id = None
+    vendor_name = None
+    device_type = None
     min_timeout = 0.1
     refresh_time = None
     age_limit = 4
     age_limit_fast = 1
     fast_regs = ('/Ac/L1/Power', '/Ac/L2/Power', '/Ac/L3/Power', '/Ac/Power')
     allowed_roles = None
+    default_access = 'holding'
+    reg_hole_max = None
+    reg_barrier = None
 
     def __init__(self):
         self.role = None
@@ -61,6 +76,7 @@ class BaseDevice:
         self.dbus_settings = {}
         self.info_regs = []
         self.data_regs = []
+        self.alias_regs = {}
 
     def destroy(self):
         if self.dbus:
@@ -71,9 +87,32 @@ class BaseDevice:
             self.settings._settings = None
             self.settings = None
 
+    def pack_regs(self, regs):
+        if self.reg_hole_max is not None:
+            hole_max = self.reg_hole_max
+        else:
+            hole_max = (modbus_overhead(self.modbus.method) + 1) // 2
+
+        regs = flatten(regs)
+
+        ra = {}
+        for r in regs:
+            ra.setdefault(r.access or self.default_access, []).append(r)
+
+        rr = []
+        for a, r in ra.items():
+            rr += pack_list(r, a, hole_max, self.reg_barrier)
+
+        return rr
+
+    def read_modbus(self, start, count, access=None):
+        if access is None:
+            access = self.default_access
+
+        return self.modbus.read_registers(start, count, access, unit=self.unit)
+
     def read_register(self, reg):
-        rr = self.modbus.read_holding_registers(reg.base, reg.count,
-                                                unit=self.unit)
+        rr = self.read_modbus(reg.base, reg.count, reg.access)
 
         if rr.isError():
             self.log.error('Error reading register %#04x: %s', reg.base, rr)
@@ -106,7 +145,7 @@ class BaseDevice:
         start = regs[0].base
         count = regs[-1].base + regs[-1].count - start
 
-        rr = self.modbus.read_holding_registers(start, count, unit=self.unit)
+        rr = self.read_modbus(start, count, regs.access)
 
         latency = time.time() - now
 
@@ -121,7 +160,7 @@ class BaseDevice:
             if now - reg.time > reg.max_age:
                 if reg.decode(rr.registers[base:end]) or not reg.time:
                     if reg.name:
-                        d[reg.name] = copy(reg) if reg.isvalid() else None
+                        d[reg.name] = reg.copy_if_valid()
                 reg.time = now
 
         return latency
@@ -195,9 +234,16 @@ class BaseDevice:
         self.dbus.add_path(path, self.settings[setting], writeable=True,
                            onchangecallback=cb)
 
-    def get_role_instance(self):
-        val = self.settings['instance'].split(':')
-        return val[0], int(val[1])
+    def get_role_instance(self, retry=True):
+        try:
+            val = self.settings['instance'].split(':')
+            return val[0], int(val[1])
+        except:
+            if retry:
+                self.log.info('Invalid role/instance, resetting')
+                self.settings['instance'] = self._settings['instance'][1]
+                return self.get_role_instance(False)
+            raise
 
     def role_changed(self, path, val):
         if val not in self.allowed_roles:
@@ -229,15 +275,30 @@ class BaseDevice:
 
         return False
 
-    def dbus_add_register(self, r):
-        if r.name in self.dbus:
-            del self.dbus[r.name]
-        v = copy(r) if r.isvalid() else None
+    def dbus_add_register(self, r, name=None):
+        if name is None:
+            name = r.name
+
+        if name in self.dbus:
+            del self.dbus[name]
+        v = r.copy_if_valid()
         if r.write:
             cb = partial(self.dbus_write_register, r)
-            self.dbus.add_path(r.name, v, writeable=True, onchangecallback=cb)
+            self.dbus.add_path(name, v, writeable=True, onchangecallback=cb)
         else:
-            self.dbus.add_path(r.name, v)
+            self.dbus.add_path(name, v)
+
+        for alias in self.alias_regs.get(name, ()):
+            self.dbus_add_reg_alias(r, alias)
+
+    def dbus_add_reg_alias(self, r, name):
+        r.onchange = partial(self.dbus_update_alias, name, r.onchange)
+        self.dbus_add_register(r, name)
+
+    def dbus_update_alias(self, name, onchange, reg):
+        if onchange:
+            onchange(reg)
+        self.dbus[name] = reg.copy_if_valid()
 
     def set_max_age(self, reg):
         if reg.name in self.fast_regs:
@@ -249,7 +310,7 @@ class BaseDevice:
         ident = self.get_ident()
 
         svcname = 'com.victronenergy.%s.%s' % (self.role, ident)
-        self._dbus = VeDbusService(svcname, private_bus())
+        self._dbus = VeDbusService(svcname, private_bus(), register=False)
         self.dbus = ServiceContext(self._dbus)
 
         self.dbus.add_path('/Mgmt/ProcessName', __main__.NAME)
@@ -275,7 +336,7 @@ class BaseDevice:
             self.dbus_add_register(self.info[p])
 
     def init_data_regs(self):
-        self.data_regs = pack_regs(self.modbus.method, self.data_regs)
+        self.data_regs = self.pack_regs(self.data_regs)
 
         for r in self.data_regs:
             for rr in r:
@@ -302,6 +363,15 @@ class BaseDevice:
 
     def device_init_late(self):
         pass
+
+    def get_unique(self):
+        return self.info['/Serial']
+
+    def get_ident(self):
+        return '%s_%s' % (self.vendor_id, self.get_unique())
+
+    def get_name(self):
+        return str(self.info.get('/CustomName', '')) or self.productname
 
 class ModbusDevice(BaseDevice):
     def __init__(self, spec, modbus, model):
@@ -410,6 +480,7 @@ class ModbusDevice(BaseDevice):
         self.need_reinit = False
 
         self.dbus.flush()
+        self._dbus.register()
 
         for s in self.subdevices:
             s.init()
@@ -459,6 +530,7 @@ class SubDevice(BaseDevice):
         self.subid = subid
         self.modbus = parent.modbus
         self.unit = parent.unit
+        self.default_access = parent.default_access
         self.model = parent.model
         self.productid = parent.productid
         self.productname = parent.productname
@@ -483,6 +555,7 @@ class SubDevice(BaseDevice):
         self.init_data_regs()
         self.device_init_late()
         self.dbus.flush()
+        self._dbus.register()
 
     def sched_reinit(self):
         self.parent.sched_reinit()
@@ -517,8 +590,62 @@ class CustomName:
         self.add_settings({'customname': ['/CustomName', '', 0, 0]})
         self.add_dbus_setting('customname', '/CustomName')
 
+    def get_name(self):
+        return self.settings['customname'] or super().get_name()
+
+class ErrorId:
+    err_path = '/Error/{}/Id'
+    max_errors = 8
+    error_code_offset = {
+        'cre': 0x2000,
+        'dse': 0,
+        've': 0,
+    }
+
+    def device_init_late(self):
+        super().device_init_late()
+
+        self.error_ids = [None] * self.max_errors
+
+        for i in range(len(self.error_ids)):
+            self.dbus.add_path(self.err_path.format(i), '')
+
+        if '/ErrorCode' not in self.dbus:
+            self.dbus.add_path('/ErrorCode', 0)
+
+    def set_error_ids(self, eids):
+        eids = set(eids)
+
+        for i in range(len(self.error_ids)):
+            try:
+                eids.remove(self.error_ids[i])
+            except KeyError:
+                self.error_ids[i] = None
+
+        for err in sorted(eids, key=lambda x: ('ewi'.index(x[0]), x[1])):
+            try:
+                i = self.error_ids.index(None)
+                self.error_ids[i] = err
+            except ValueError:
+                break
+
+        for i in range(len(self.error_ids)):
+            e = self.error_ids[i]
+            s = '%s:%s-%d' % (self.vendor_id, *e) if e is not None else ''
+            self.dbus[self.err_path.format(i)] = s
+
+        try:
+            err = next(filter(None, self.error_ids))
+            err_code = self.error_code_offset[self.vendor_id] + err[1]
+        except:
+            err_code = 0
+
+        self.dbus['/ErrorCode'] = err_code
+
 class EnergyMeter(ModbusDevice):
-    role_names = ['grid', 'pvinverter', 'genset', 'acload']
+    device_type = 'Energy meter'
+    role_names = ['grid', 'pvinverter', 'genset', 'acload', 'evcharger',
+                  'heatpump']
     allowed_roles = role_names
     default_role = 'grid'
     default_instance = 40
@@ -531,9 +658,29 @@ class EnergyMeter(ModbusDevice):
         if self.nr_phases is not None:
             self.dbus.add_path('/NrOfPhases', self.nr_phases)
 
-        if self.role == 'pvinverter' and self.position is None:
+        if self.position is None and self.role in ('pvinverter', 'evcharger',
+                                                   'heatpump', 'acload'):
             self.add_settings({'position': ['/Position', 0, 0, 2]})
             self.add_dbus_setting('position', '/Position')
+
+        if self.role != 'grid':
+            self.dbus.add_path('/IsGenericEnergyMeter', 1)
+
+class Genset(ModbusDevice):
+    device_type = 'Generator controller'
+    default_role = 'genset'
+    default_instance = 40
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.alias_regs.update({
+            '/RemoteStartModeEnabled': ['/AutoStart']
+        })
+
+    def device_init_late(self):
+        super().device_init_late()
+        if '/ErrorCode' not in self.dbus:
+            self.dbus.add_path('/ErrorCode', 0)
 
 class Tank:
     default_role = 'tank'

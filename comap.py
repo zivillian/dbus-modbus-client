@@ -27,13 +27,13 @@ class ComAp_Tank(device.CustomName, device.Tank, device.SubDevice):
             Reg_u16(1055, '/RawValue', 1, '%.0f %%', invalid=0x8000),
         ]
 
-class ComAp_Generator(device.ModbusDevice):
+class ComAp_Generator(device.Genset):
+    vendor_id = 'comap'
+    vendor_name = 'ComAp'
     productid = 0xB044
     productname = 'Comap genset controller'
-    allowed_roles = None
-    default_role = 'genset'
-    default_instance = 40
     min_timeout = 0.5
+    reg_hole_max = 0
 
     def device_init(self):
         self.info_regs = [
@@ -62,7 +62,7 @@ class ComAp_Generator(device.ModbusDevice):
 
             Reg_u16(1004, '/Engine/Speed',               1, '%.0f RPM', invalid=0x8000),
             Reg_s16(1006, '/Engine/CoolantTemperature',  1, '%.1f C',   invalid=-0x8000),
-            Reg_s16(1008, '/Engine/OilPressure',        10, '%.0f kPa', invalid=-0x8000),
+            Reg_s16(1008, '/Engine/OilPressure',       0.1, '%.0f kPa', invalid=-0x8000),
             Reg_u32b(1013, '/Engine/OperatingHours', 1/360, '%.1f s', invalid=0x80000000),
             Reg_u16(1053, '/StarterVoltage',            10, '%.1f V'),
 
@@ -87,7 +87,7 @@ class ComAp_Generator(device.ModbusDevice):
                 17: 9 # Another kind of venting
             }),
 
-            Reg_mapu16(1382, '/AutoStart', {
+            Reg_mapu16(1382, '/RemoteStartModeEnabled', {
                 0: 0, # OFF
                 1: 0, # MANUAL
                 2: 1, # AUTO
@@ -103,7 +103,7 @@ class ComAp_Generator(device.ModbusDevice):
                 ComAp_Tank(self, 0),
             ]
 
-    def get_ident(self):
+    def get_unique(self):
         # Use the custom name as identifier. Reasoning:
         # 1. Cannot get the serial number from modbus
         # 2. MAC address? It might be on a different subnet.
@@ -111,9 +111,11 @@ class ComAp_Generator(device.ModbusDevice):
         # 4. In the ComAp universe, this is already used to identify units on
         #    mobile connections, according to the manual. Page 222 of global
         #    manual.
-        return 'comap_%s' % self.name
+        return self.name
 
     def device_init_late(self):
+        super().device_init_late()
+
         # Fetch the current state of the coil and populate it
         state = None
         coils = self.modbus.read_coils(4700, unit=self.unit)
@@ -122,7 +124,6 @@ class ComAp_Generator(device.ModbusDevice):
 
         self.dbus.add_path('/Start', state, writeable=True,
                            onchangecallback=self._start_genset)
-        self.dbus.add_path('/ErrorCode', 0)
 
     def _start_genset(self, path, value):
         # This is documented in the Comap global manual, page 204.
@@ -136,7 +137,7 @@ class ComAp_Generator(device.ModbusDevice):
 
 models = {
     'InteliLite4-': { # InteliLite4-
-        'model': 'ComAp InteliLite4-based genset',
+        'model': 'InteliLite 4',
         'handler': ComAp_Generator,
     }
 }

@@ -42,11 +42,14 @@ class timeout:
 def get_networks(blacklist):
     '''Get IPv4 networks of host
 
-    Return a list of IPv4Interface objects corresponding to active
-    network interfaces with a global scope address.
+    Return a list of IPv4Network objects corresponding to active
+    network interfaces with a global scope address and a (possibly
+    longer) list of IPv4Address objects representing the host's
+    addresses on these networks.
 
     :param blacklist: list of interface names to ignore
-    :returns: list of IPv4Interface objects
+    :returns: list of IPv4Network objects, IPv4Address objects
+
     '''
 
     nets = []
@@ -58,12 +61,15 @@ def get_networks(blacklist):
                 if v[0] in blacklist:
                     continue
 
-                net = ipaddress.IPv4Interface(u'' + v[2])
+                net = ipaddress.IPv4Interface(v[2])
                 nets.append(net)
     except:
         pass
 
-    return nets
+    addrs = [n.ip for n in nets]
+    nets = list(ipaddress.collapse_addresses([n.network for n in nets]))
+
+    return nets, addrs
 
 def get_enum(enum, val, default=None):
     '''Get enum for value
@@ -87,3 +93,25 @@ def get_super(base, t):
         t = type(t)
 
     return t.__mro__[t.__mro__.index(base) + 1]
+
+def flatten(a):
+    b = []
+
+    for x in a:
+        if isinstance(x, (list, tuple)):
+            b += flatten(x)
+        else:
+            b.append(x)
+
+    return b
+
+def getbits(v, size):
+    bit = 0
+
+    for x in iter(v):
+        if x:
+            for b in range(size):
+                if x & (1 << b):
+                    yield bit + b
+
+        bit += size

@@ -48,7 +48,8 @@ def probe(mlist, pr_cb=None, pr_interval=10, timeout=None, filt=None):
                 break
 
             if d:
-                d.log.info('Found %s', d.model)
+                d.log.info('Found %s: %s %s',
+                           d.device_type, d.vendor_name, d.model)
                 d.latency = t1 - t0
                 d.timeout = max(d.min_timeout, d.latency * 4)
                 found.append(d)
@@ -98,18 +99,37 @@ class ModelRegister:
         self.units = args.get('units', [])
         self.rates = args.get('rates', [])
 
+        if reg.access:
+            self.access = [reg.access]
+        else:
+            self.access = {m['handler'].default_access for m in models.values()}
+
     def probe(self, spec, modbus, timeout=None):
         with modbus, utils.timeout(modbus, timeout or self.timeout):
             if not modbus.connect():
                 raise Exception('connection error')
-            rr = modbus.read_holding_registers(self.reg.base, self.reg.count,
-                unit=spec.unit)
+
+            for acs in self.access:
+                rr = modbus.read_registers(self.reg.base, self.reg.count,
+                                           acs, unit=spec.unit)
+                if not rr.isError():
+                    break
 
         if rr.isError():
             log.debug('%s: %s', modbus, rr)
             return None
 
-        self.reg.decode(rr.registers)
-        if self.reg.value in self.models:
+        try:
+            self.reg.decode(rr.registers)
             m = self.models[self.reg.value]
             return m['handler'](spec, modbus, m['model'])
+        except:
+            return None
+
+    def get_models(self):
+        m = []
+        for v in self.models.values():
+            h = v['handler']
+            m.append((h.vendor_name, h.device_type, v['model']))
+
+        return m

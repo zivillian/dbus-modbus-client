@@ -2,7 +2,7 @@ import struct
 
 import device
 import probe
-from register import Reg, Reg_s16, Reg_u16, Reg_s32b, Reg_u32b, Reg_mapu16
+from register import *
 
 class Reg_DSE_serial(Reg, str):
     """ Deep Sea Electronics Controllers use a 32-bit integer as serial number. Make it a string
@@ -61,64 +61,6 @@ class Reg_DSE_s32b(Reg_DSE_num, Reg_s32b):
 class Reg_DSE_u32b(Reg_DSE_num, Reg_u32b):
     invalid_mask = 0xffffffff
 
-class Reg_DSE_alarm(Reg, int):
-    """ Decode DSE alarm registers into error codes, which
-        are offset for correct error string mapping """
-
-    def __init__(self, base, count, alarm_code_offset):
-        # Note: Base register has to be first on GenComm page
-        # definition ("Number of named alarms")
-        super().__init__(base=base, count=count, name='/ErrorCode')
-        self.alarm_code_offset = alarm_code_offset
-
-    def _interpret_alarm_value(self, val):
-        """ Meaning according to GenComm specification:
-            0      Disabled digital input
-            1      Not active alarm
-            2      Warning alarm
-            3      Shutdown alarm
-            4      Electrical trip alarm
-            5-7    Reserved
-            8      Inactive indication (no string)
-            9      Inactive indication (displayed string)
-            10     Active indication
-            11-14  Reserved
-            15     Unimplemented alarm """
-        if val == 1: return False
-        if 2 <= val <= 4: return True
-        return None
-
-    def _decode_into_4bits(self, z):
-        """ Splits register value into four 4 bit integers and interprets the
-            numbers """
-        vals = [
-            z >> 12 & 0xF,
-            z >> 8 & 0xF,
-            z >> 4 & 0xF,
-            z & 0xF
-        ]
-        return map(self._interpret_alarm_value, vals)
-
-    def _decode_alarm_registers(self, values):
-        """ Returns a list of all alarms with bool or None values
-            True indicates active alarm,
-            False indicates inactive alarm,
-            None indicates an unimplemented or unknown alarm state """
-        alarms = list()
-        for reg_val in values:
-            alarms.extend(self._decode_into_4bits(reg_val))
-        return alarms
-
-    def decode(self, values):
-        alarms = self._decode_alarm_registers(values[1:])
-        try:
-            # if multiple alarms firing, only first one is displayed
-            alarm_idx = self.alarm_code_offset + alarms.index(True)
-            return self.update(alarm_idx)
-        except ValueError:
-            # No alarms firing
-            return self.update(0)
-
 class DSE_Tank(device.CustomName, device.Tank, device.SubDevice):
     raw_value_min = 0
     raw_value_max = 100
@@ -129,15 +71,15 @@ class DSE_Tank(device.CustomName, device.Tank, device.SubDevice):
             Reg_DSE_u16(1027, '/RawValue', 1, '%.0f %%'),
         ]
 
-class DSE_Generator(device.CustomName, device.ModbusDevice):
+class DSE_Generator(device.CustomName, device.ErrorId, device.Genset):
+    vendor_id = 'dse'
+    vendor_name = 'Deep Sea Electronics'
     productid = 0xB046
     productname = 'DSE genset controller'
-    allowed_roles = None
-    default_role = 'genset'
-    default_instance = 40
     min_timeout = 1         # Increased timeout for less corrupted messages
 
     init_status_code = None
+    has_remote_start = None
 
     # GenComm System Control Function keys
     SCF_SELECT_AUTO_MODE = 35701     # Select Auto mode
@@ -147,6 +89,12 @@ class DSE_Generator(device.CustomName, device.ModbusDevice):
     # Stores 8 register values which indicate of a regarding
     # GenComm System Control Functions is available
     scf_reg_vals = None
+
+    alarm_level = {
+        2: 'w',     # Warning alarm
+        3: 'e',     # Shutdown alarm
+        4: 'e',     # Electrical trip alarm
+    }
 
     def __init__(self, *args):
         super().__init__(*args)
@@ -206,6 +154,14 @@ class DSE_Generator(device.CustomName, device.ModbusDevice):
                 return False
         return True
 
+    def _get_alarm_codes(self, values):
+        for v in enumerate(values):
+            level = self.alarm_level.get(v[1], None)
+            if level:
+                yield (level, self.alarm_code_offset + v[0])
+
+    def alarm_changed(self, reg):
+        self.set_error_ids(self._get_alarm_codes(reg.value))
 
     def device_init(self):
 
@@ -233,7 +189,7 @@ class DSE_Generator(device.CustomName, device.ModbusDevice):
 
             Reg_DSE_u16(1029, '/StarterVoltage',            10, '%.1f V'),
 
-            Reg_mapu16(772, '/AutoStart', {
+            Reg_mapu16(772, '/RemoteStartModeEnabled', {
                 0: 0, # Stop mode
                 1: 1, # Auto mode
                 2: 0, # Manual mode
@@ -243,7 +199,8 @@ class DSE_Generator(device.CustomName, device.ModbusDevice):
                 6: 0, # Test off load mode
                 7: 0, # Off mode
             }),
-            Reg_DSE_alarm(self.alarm_base, self.alarm_count, self.alarm_code_offset),
+            Reg_packed(self.alarm_base, self.alarm_count, bits=4, items=4,
+                       onchange=self.alarm_changed)
         ]
 
         # Check, if status register is implemented on controller
@@ -257,10 +214,6 @@ class DSE_Generator(device.CustomName, device.ModbusDevice):
             self.subdevices = [
                 DSE_Tank(self, 0),
             ]
-
-    def get_ident(self):
-        return 'dse_%s' % self.info['/Serial']
-
 
     def _status_register_available(self):
         return self.init_status_code is not None
@@ -276,8 +229,6 @@ class DSE_Generator(device.CustomName, device.ModbusDevice):
         super().device_init_late()
 
         # Additional static paths
-        if '/ErrorCode' not in self.dbus:
-            self.dbus.add_path('/ErrorCode', 0)
         if '/FirmwareVersion' not in self.dbus:
             self.dbus.add_path('/FirmwareVersion', None)
 
@@ -290,6 +241,7 @@ class DSE_Generator(device.CustomName, device.ModbusDevice):
             engine_speed_reg_val = self.read_register(self.engine_speed_reg)
             if engine_speed_reg_val is None:
                 self.log.error('Cannot detect engine status by RPM, as register is not available')
+                self.dbus.add_path('/StatusCode', None)
             else:
                 self.log.info('Detecting engine status by RPM')
                 status_code = self._get_status_code_from_rpm(engine_speed_reg_val)
@@ -301,12 +253,26 @@ class DSE_Generator(device.CustomName, device.ModbusDevice):
 
         # Add /Start path, if GenComm System Control Functions
         # for genset telemetry start are available
-        if self._check_scf_support(self.SCF_TELEMETRY_START, self.SCF_TELEMETRY_STOP):
+        if self.has_remote_start is None:
+            self.has_remote_start = self._check_scf_support(self.SCF_TELEMETRY_START, self.SCF_TELEMETRY_STOP)
+
+        if self.has_remote_start:
             self.dbus.add_path(
                 '/Start',
                 1 if is_running else 0,
                 writeable=True,
                 onchangecallback=self._start_genset
+            )
+
+        # Add /EnableRemoteStartMode path, if GenComm System Control Function
+        # for setting into Auto Mode (DSE terminology) is available
+        # (depends on DSE controller model)
+        if self._check_scf_support(self.SCF_SELECT_AUTO_MODE):
+            self.dbus.add_path(
+                '/EnableRemoteStartMode',
+                0,
+                writeable=True,
+                onchangecallback=self._set_remote_start_mode
             )
 
     def device_update(self):
@@ -323,92 +289,304 @@ class DSE_Generator(device.CustomName, device.ModbusDevice):
             self._write_scf_key(self.SCF_TELEMETRY_STOP)
         return True
 
+    def _set_remote_start_mode(self, _, value):
+        if value == 1:
+            self._write_scf_key(self.SCF_SELECT_AUTO_MODE)
+        return True
 
 class DSE4xxx_Generator(DSE_Generator):
     """ This uses the "old alarm system" of GenComm page 8,
         related error strings allocate 0x1000 to 0x10FF """
-    alarm_base = 2048
-    alarm_count = 26
+    alarm_base = 2049
+    alarm_count = 25
     alarm_code_offset = 0x1000
 
 class DSE71xx_66xx_60xx_L40x_4xxx_45xx_MkII_Generator(DSE_Generator):
     """ This uses "Named Alarm Conditions" of GenComm page 154 for
         DSE 71xx/66xx/60xx/L40x/4xxx/45xx MkII family, related
         error strings allocate 0x1500 to 0x15FF """
-    alarm_base = 39424
-    alarm_count = 12
+    alarm_base = 39425
+    alarm_count = 11
     alarm_code_offset = 0x1500
 
 class DSE61xx_MkII_Generator(DSE_Generator):
     """ This uses "Named Alarm Conditions" of GenComm page 154 for
         DSE 61xx MkII, related error strings allocate 0x1100 to 0x11FF """
-    alarm_base = 39424
-    alarm_count = 16
+    alarm_base = 39425
+    alarm_count = 15
     alarm_code_offset = 0x1100
 
 class DSE72xx_73xx_61xx_74xx_MkII_Generator(DSE_Generator):
     """ This uses "Named Alarm Conditions" of GenComm page 154 for
         DSE 72xx/73xx/61xx/74xx MkII family, related error strings
         allocate 0x1200 to 0x12FF """
-    alarm_base = 39424
-    alarm_count = 21
+    alarm_base = 39425
+    alarm_count = 20
     alarm_code_offset = 0x1200
 
 class DSE8xxx_Generator(DSE_Generator):
     """ This uses "Named Alarm Conditions" of GenComm page 154 for
         DSE 8xxx family, related error strings allocate 0x1300 to 0x13FF """
-    alarm_base = 39424
-    alarm_count = 40
+    alarm_base = 39425
+    alarm_count = 39
     alarm_code_offset = 0x1300
 
+class DSE4520_MKII(DSE71xx_66xx_60xx_L40x_4xxx_45xx_MkII_Generator):
+    """ DSE 4520 MKII is a special case, as it reports support for
+        Telemetry Start and Stop, but actually does not support that """
+    has_remote_start = False
 
 models = {
-    '1-4623': {
-        'model':    'DSE 4620/4623',
+
+    # MK I
+    '1-3110': {
+        'model':    '3110',
         'handler':  DSE4xxx_Generator,
     },
+    '1-3111': {
+        'model':    '3110',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-3211': {
+        'model':    '3210',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4311': {
+        'model':    '4310',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4310': {
+        'model':    '4310',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4320': {
+        'model':    '4320',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4321': {
+        'model':    '4320',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4410': {
+        'model':    '4410',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4411': {
+        'model':    '4410',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4420': {
+        'model':    '4420',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4421': {
+        'model':    '4420',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4511': {
+        'model':    '4510',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4510': {
+        'model':    '4510',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4513': {
+        'model':    '4510',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4521': {
+        'model':    '4520',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4520': {
+        'model':    '4520',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4523': {
+        'model':    '4520',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4611': {
+        'model':    '4610',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4610': {
+        'model':    '4610',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4613': {
+        'model':    '4610',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4621': {
+        'model':    '4620',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4620': {
+        'model':    '4620',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-4623': {
+        'model':    '4620',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-6010': {
+        'model':    '6010',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-6011': {
+        'model':    '6010',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-6012': {
+        'model':    '6012',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-6020': {
+        'model':    '6020',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-6021': {
+        'model':    '6020',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-6110': {
+        'model':    '6110',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-6111': {
+        'model':    '6110',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-6120': {
+        'model':    '6120',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-6121': {
+        'model':    '6120',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-7110': {
+        'model':    '7110',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-7113': {
+        'model':    '7110',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-7120': {
+        'model':    '7120',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-7123': {
+        'model':    '7120',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-7210': {
+        'model':    '7210',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-7220': {
+        'model':    '7220',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-7310': {
+        'model':    '7310',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-7320': {
+        'model':    '7320',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-7410': {
+        'model':    '7410',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-7420': {
+        'model':    '7420',
+        'handler':  DSE4xxx_Generator,
+    },
+    '1-7450': {
+        'model':    '7450',
+        'handler':  DSE4xxx_Generator,
+    },
+
+    # MK II
     '1-32808': {
-        'model':    'DSE 4510 MKII',
+        'model':    '4510 MKII',
+        'handler':  DSE71xx_66xx_60xx_L40x_4xxx_45xx_MkII_Generator,
+    },
+    '1-32807': {
+        'model':    '4520 MKII',
+        'handler':  DSE4520_MKII,
+    },
+    '1-32789': {
+        'model':    '6010 MKII',
+        'handler':  DSE71xx_66xx_60xx_L40x_4xxx_45xx_MkII_Generator,
+    },
+    '1-32790': {
+        'model':    '6010 MKII',
+        'handler':  DSE71xx_66xx_60xx_L40x_4xxx_45xx_MkII_Generator,
+    },
+    '1-32791': {
+        'model':    '6020 MKII',
+        'handler':  DSE71xx_66xx_60xx_L40x_4xxx_45xx_MkII_Generator,
+    },
+    '1-32792': {
+        'model':    '6020 MKII',
         'handler':  DSE71xx_66xx_60xx_L40x_4xxx_45xx_MkII_Generator,
     },
     '1-32800': {
-        'model':    'DSE 6110 MKII',
+        'model':    '6110 MKII',
         'handler':  DSE61xx_MkII_Generator,
     },
-    '1-6121': {
-        'model':    'DSE 6120',
-        'handler':  DSE4xxx_Generator,
-    },
-    '1-32859': {
-        'model':    'DSE 6120 MKIII',
-        'handler':  DSE61xx_MkII_Generator,
+    '1-32801': {
+        'model':    '6120 MKII',
+        'handler':  DSE72xx_73xx_61xx_74xx_MkII_Generator,
     },
     '1-32840': {
-        'model':    'DSE 7310 MKII',
+        'model':    '7310 MKII',
+        'handler':  DSE72xx_73xx_61xx_74xx_MkII_Generator,
+    },
+    '1-32841': {
+        'model':    '7320 MKII',
         'handler':  DSE72xx_73xx_61xx_74xx_MkII_Generator,
     },
     '1-32845': {
-        'model':    'DSE 7410 MKII',
+        'model':    '7410 MKII',
         'handler':  DSE72xx_73xx_61xx_74xx_MkII_Generator,
     },
     '1-32846': {
-        'model':    'DSE 7420 MKII',
+        'model':    '7420 MKII',
         'handler':  DSE72xx_73xx_61xx_74xx_MkII_Generator,
     },
     '1-32832': {
-        'model':    'DSE 8610 MKII',
+        'model':    '8610 MKII',
         'handler':  DSE8xxx_Generator,
     },
     '1-32833': {
-        'model':    'DSE 8620 MKII',
+        'model':    '8620 MKII',
         'handler':  DSE8xxx_Generator,
     },
     '1-32834': {
-        'model':    'DSE 8660 MKII',
+        'model':    '8660 MKII',
         'handler':  DSE8xxx_Generator,
     },
+
+    # MK III
+    '1-32858': {
+        'model':    '6110 MKIII',
+        'handler':  DSE61xx_MkII_Generator,
+    },
+    '1-32859': {
+        'model':    '6120 MKIII',
+        'handler':  DSE61xx_MkII_Generator,
+    },
+
 }
 
 
 probe.add_handler(probe.ModelRegister(Reg_DSE_ident(), models,
-                                      methods=['tcp'], units=[1]))
+                                      methods=['tcp', 'rtu'], units=[1, 10],
+                                      rates=[19200, 115200]))

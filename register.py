@@ -1,3 +1,4 @@
+from copy import copy
 import struct
 from utils import get_enum
 from collections.abc import Iterable
@@ -7,7 +8,7 @@ class Reg:
         return super().__new__(cls)
 
     def __init__(self, base, count, name=None, text=None, write=False,
-                 max_age=None, onchange=None):
+                 max_age=None, onchange=None, access=None):
         self.base = base
         self.count = count
         self.name = name
@@ -17,6 +18,7 @@ class Reg:
         self.time = 0
         self.max_age = max_age
         self.text = text
+        self.access = access
 
     def __eq__(self, other):
         if isinstance(other, type(self)):
@@ -51,6 +53,15 @@ class Reg:
         if self.onchange and changed:
             self.onchange(self)
         return changed
+
+    def decode(self, values):
+        return self.update(values)
+
+    def encode(self):
+        return self.value
+
+    def copy_if_valid(self):
+        return copy(self) if self.isvalid() else None
 
 class Reg_num(Reg, float):
     rtype = int
@@ -89,9 +100,18 @@ class Reg_u32b(Reg_num):
     coding = ('>I', '>2H')
     count = 2
 
+class Reg_s64b(Reg_num):
+    coding = ('>q', '>4H')
+    count = 4
+
 class Reg_u64b(Reg_num):
     coding = ('>Q', '>4H')
     count = 4
+
+class Reg_f32b(Reg_num):
+    coding = ('>f', '>2H')
+    count = 2
+    rtype = float
 
 class Reg_s32l(Reg_num):
     coding = ('<i', '<2H')
@@ -100,6 +120,14 @@ class Reg_s32l(Reg_num):
 class Reg_u32l(Reg_num):
     coding = ('<I', '<2H')
     count = 2
+
+class Reg_s64l(Reg_num):
+    coding = ('<q', '<4H')
+    count = 4
+
+class Reg_u64l(Reg_num):
+    coding = ('<Q', '<4H')
+    count = 4
 
 class Reg_f32l(Reg_num):
     coding = ('<f', '<2H')
@@ -148,3 +176,39 @@ class Reg_map:
 
 class Reg_mapu16(Reg_map, Reg_u16):
     pass
+
+class Reg_packed(Reg):
+    def __init__(self, base, count, *args, bits, items, **kwargs):
+        super().__init__(base, count, *args, **kwargs)
+        self.bits = bits
+        self.mask = (1 << bits) - 1
+        self.init_pos = bits * (items - 1)
+
+    def unpack(self, values):
+        values = iter(values)
+        pos = -1
+
+        while True:
+            if pos < 0:
+                try:
+                    val = next(values)
+                    pos = self.init_pos
+                except StopIteration:
+                    return
+
+            yield (val >> pos) & self.mask
+            pos -= self.bits
+
+    def decode(self, values):
+        return self.update(list(self.unpack(values)))
+
+class Reg_bit(Reg, int):
+    def __init__(self, base, *args, bit, set=1, unset=0, **kwargs):
+        super().__init__(base, 1 + bit // 16, *args, **kwargs)
+        self.bit = bit
+        self.set = set
+        self.unset = unset
+
+    def decode(self, values):
+        v = values[self.bit // 16] & (1 << self.bit % 16)
+        return self.update(self.set if v else self.unset)

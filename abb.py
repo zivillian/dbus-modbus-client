@@ -2,6 +2,7 @@ import struct
 import device
 import probe
 from register import Reg, Reg_s32b, Reg_u16, Reg_u32b, Reg_u64b, Reg_text
+from register import Reg_s16
 
 class Reg_serial(Reg, str):
     """ ABB meters use a 32-bit integer as serial number. Make it a string
@@ -14,6 +15,8 @@ class Reg_serial(Reg, str):
         return self.update(str(v[0]))
 
 class ABB_Meter(device.CustomName, device.EnergyMeter):
+    vendor_id = 'abb'
+    vendor_name = 'ABB'
     productid = 0xb033
     min_timeout = 0.5
 
@@ -34,9 +37,6 @@ class ABB_Meter(device.CustomName, device.EnergyMeter):
             Reg_u32b(0x5B0C, '/Ac/L1/Current',     100, '%.1f A'),
         ]
 
-    def get_ident(self):
-        return 'abb_{}'.format(self.info['/Serial'])
-
 class ABB_Meter_1P(ABB_Meter):
     productname = 'ABB B21 Energy Meter'
     nr_phases = 1
@@ -49,6 +49,7 @@ class ABB_Meter_1P(ABB_Meter):
             Reg_s32b(0x5B14, '/Ac/L1/Power',          100, '%.1f W'),
             Reg_u64b(0x5000, '/Ac/L1/Energy/Forward', 100, '%.1f kWh'),
             Reg_u64b(0x5004, '/Ac/L1/Energy/Reverse', 100, '%.1f kWh', invalid=0xffffffffffffffff),
+            Reg_s16( 0x5B3A, '/Ac/L1/PowerFactor',   1000, '%.3f', invalid=0x7FFF),
         ]
 
 class ABB_Meter_3P(ABB_Meter):
@@ -73,6 +74,10 @@ class ABB_Meter_3P(ABB_Meter):
             Reg_u64b(0x546C, '/Ac/L1/Energy/Reverse', 100, '%.1f kWh', invalid=0xffffffffffffffff),
             Reg_u64b(0x5470, '/Ac/L2/Energy/Reverse', 100, '%.1f kWh', invalid=0xffffffffffffffff),
             Reg_u64b(0x5474, '/Ac/L3/Energy/Reverse', 100, '%.1f kWh', invalid=0xffffffffffffffff),
+
+            Reg_s16( 0x5B3B, '/Ac/L1/PowerFactor',   1000, '%.3f', invalid=0x7FFF),
+            Reg_s16( 0x5B3C, '/Ac/L2/PowerFactor',   1000, '%.3f', invalid=0x7FFF),
+            Reg_s16( 0x5B3D, '/Ac/L3/PowerFactor',   1000, '%.3f', invalid=0x7FFF),
         ]
 
 models = {

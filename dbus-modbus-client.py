@@ -7,12 +7,15 @@ import faulthandler
 from functools import partial
 import os
 import pymodbus.constants
-from settingsdevice import SettingsDevice
 import signal
+import sys
 import time
 import traceback
-from vedbus import VeDbusService
 from gi.repository import GLib
+
+sys.path.insert(1, os.path.join(os.path.dirname(__file__), 'ext', 'velib_python'))
+from settingsdevice import SettingsDevice
+from vedbus import VeDbusService
 
 import device
 import devspec
@@ -22,20 +25,22 @@ from scan import *
 from utils import *
 import watchdog
 
+import abb
 import carlo_gavazzi
+import comap
+import cre
+import deif
 import dse
 import Eastron_SDM72D
 import ev_charger
 import smappee
-import abb
-import comap
 import victron_em
 
 import logging
 log = logging.getLogger()
 
 NAME = os.path.basename(__file__)
-VERSION = '1.51'
+VERSION = '1.74'
 
 __all__ = ['NAME', 'VERSION']
 
@@ -56,6 +61,21 @@ if_blacklist = [
 
 def percent(path, val):
     return '%d%%' % val
+
+class Device:
+    def __init__(self, d, nosave):
+        self.d = d
+        self.nosave = nosave
+        self.last_seen = time.time()
+
+    def __eq__(self, other):
+        return str(self) == str(other)
+
+    def __hash__(self):
+        return hash(self.d)
+
+    def __str__(self):
+        return str(self.d)
 
 class Client:
     def __init__(self, name):
@@ -95,8 +115,8 @@ class Client:
                 continue
 
             try:
-                self.init_device(d, False)
-                self.devices.append(d)
+                dd = self.init_device(d, False)
+                self.devices.append(dd)
             except:
                 log.info('Error initialising %s, skipping', d)
                 traceback.print_exc()
@@ -119,24 +139,23 @@ class Client:
 
     def init_device(self, dev, nosave=False, enable=True):
         dev.init(self.dbusconn, enable)
-        dev.last_seen = time.time()
-        dev.nosave = nosave
+        return Device(dev, nosave)
 
     def del_device(self, dev):
         self.devices.remove(dev)
-        dev.destroy()
+        dev.d.destroy()
 
     def dev_failed(self, dev):
         if not dev.nosave:
-            self.failed.append(dev.spec)
+            self.failed.append(dev.d.spec)
 
     def update_device(self, dev):
         try:
-            dev.update()
+            dev.d.update()
             dev.last_seen = time.time()
         except Exception as ex:
             if time.time() - dev.last_seen > FAIL_TIMEOUT:
-                dev.log.info('Device failed: %s', ex)
+                dev.d.log.info('Device failed: %s', ex)
                 if self.err_exit:
                     os._exit(1)
                 self.dev_failed(dev)
@@ -151,8 +170,8 @@ class Client:
 
         for d in devs:
             try:
-                self.init_device(d, nosave, enable)
-                self.devices.append(d)
+                dd = self.init_device(d, nosave, enable)
+                self.devices.append(dd)
             except:
                 failed.append(d.spec)
                 d.destroy()
@@ -267,7 +286,7 @@ class NetClient(Client):
         super().init_settings()
 
         svcname = 'com.victronenergy.modbusclient.%s' % self.name
-        self.svc = VeDbusService(svcname, self.dbusconn)
+        self.svc = VeDbusService(svcname, self.dbusconn, register=True)
         self.svc.add_path('/Scan', False, writeable=True,
                           onchangecallback=self.set_scan)
         self.svc.add_path('/ScanProgress', None, gettextcallback=percent)
@@ -303,21 +322,24 @@ class NetClient(Client):
                 self.probe_devices(maddr, nosave=True, enable=False)
 
     def init_device(self, dev, *args):
-        super().init_device(dev, *args)
+        r = super().init_device(dev, *args)
+        r.dev_path = None
 
-        if dev.nosave:
-            dev_path = '/Devices/' + dev.get_ident()
+        if r.nosave:
+            r.dev_path = '/Devices/' + dev.get_ident()
             with self.svc as s:
-                s.add_path(dev_path + '/Enabled', int(dev.enabled),
+                s.add_path(r.dev_path + '/Enabled', int(dev.enabled),
                            writeable=True,
                            onchangecallback=partial(self.enable_device, dev))
-                s.add_path(dev_path + '/Serial', dev.info['/Serial'])
-                name = str(dev.info.get('/CustomName', '')) or dev.productname
-                s.add_path(dev_path + '/Name', name)
+                s.add_path(r.dev_path + '/Serial', dev.info['/Serial'])
+                s.add_path(r.dev_path + '/Name', dev.get_name())
+
+        return r
 
     def del_device(self, dev):
-        with self.svc as s:
-            s.del_tree('/Devices/' + dev.get_ident())
+        if dev.dev_path is not None:
+            with self.svc as s:
+                s.del_tree(dev.dev_path)
         super().del_device(dev)
 
     def dev_failed(self, dev):
@@ -343,12 +365,51 @@ class SerialClient(Client):
     def new_scanner(self, full):
         return SerialScanner(self.tty, self.rate, self.mode, full=full)
 
+def list_models():
+    models = []
+    for d in probe.device_types:
+        models += d.get_models()
+
+    models.sort(key=lambda x: ''.join(x).lower())
+    models.insert(0, ('Manufacturer', 'Type', 'Model'))
+
+    def maxlen(m, n):
+        return max(len(x[n]) for x in m)
+
+    w = (maxlen(models, 0), maxlen(models, 1), maxlen(models, 2))
+    models.insert(1, list(map(lambda x: '-' * x, w)))
+
+    def newval(l, m, n):
+        return m[n] if m[n] != l[n] or m[0] != l[0] else ''
+
+    last = (None, None, None)
+    for m in models:
+        v = list(map(partial(newval, last, m), range(3)))
+        print('| %-*s | %-*s | %-*s |' % (w[0], v[0], w[1], v[1], w[2], v[2]))
+        last = m
+
+def print_info(_, d):
+    if not d:
+        return
+
+    d.device_init()
+    d.read_info()
+
+    for i in sorted(d.info.items()):
+        d.log.info('%-20s %s', *i)
+
+def probe_info(devlist):
+    probe.probe(map(devspec.fromstring, devlist), print_info)
+
 def main():
     parser = ArgumentParser(add_help=True)
     parser.add_argument('-d', '--debug', help='enable debug logging',
                         action='store_true')
     parser.add_argument('-f', '--force-scan', action='store_true')
     parser.add_argument('-m', '--mode', choices=['ascii', 'rtu'], default='rtu')
+    parser.add_argument('--models', action='store_true',
+                        help='List supported device models')
+    parser.add_argument('-P', '--probe', action='append')
     parser.add_argument('-r', '--rate', type=int, action='append')
     parser.add_argument('-s', '--serial')
     parser.add_argument('-x', '--exit', action='store_true',
@@ -360,6 +421,16 @@ def main():
                         level=(logging.DEBUG if args.debug else logging.INFO))
 
     logging.getLogger('pymodbus.client.sync').setLevel(logging.CRITICAL)
+
+    if args.models:
+        list_models()
+        return
+
+    if args.probe:
+        probe_info(args.probe)
+        return
+
+    log.info('%s v%s', NAME, VERSION)
 
     signal.signal(signal.SIGINT, lambda s, f: os._exit(1))
     faulthandler.register(signal.SIGUSR1)

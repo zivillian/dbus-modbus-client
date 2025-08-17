@@ -90,7 +90,7 @@ class CurrentTransformer:
         self.phase = self.dev.read_register(self.regs[0])
 
         if self.phase is None:
-            self.log.warn('CT %d configured outside Venus', n)
+            self.log.warning('CT %d configured outside Venus', n)
             return False
 
         return True
@@ -109,6 +109,8 @@ class CurrentTransformer:
         self.dev.write_register(Reg_u16(0x0900 + self.slot), v)
 
 class PowerBox(device.CustomName, device.EnergyMeter):
+    vendor_id = 'smappee'
+    vendor_name = 'Smappee'
     productid = 0xb018
     productname = 'Smappee Power Box'
     min_fwver = (1, 44)
@@ -268,9 +270,6 @@ class PowerBox(device.CustomName, device.EnergyMeter):
     def dbus_write_register(self, reg, path, val):
         super().dbus_write_register(reg, path, val)
         self.sched_reinit()
-
-    def get_ident(self):
-        return 'smappee_%s' % self.info['/Serial']
 
     def write_modbus(self, base, val):
         self.modbus.write_registers(base, val, unit=self.unit)

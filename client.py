@@ -6,7 +6,7 @@ import time
 from pymodbus.client.sync import *
 from pymodbus.utilities import computeCRC
 
-class RefCount:
+class ModbusExtras:
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.refcount = 1
@@ -33,10 +33,19 @@ class RefCount:
         finally:
             self.in_transaction = False
 
-class TcpClient(RefCount, ModbusTcpClient):
+    def read_registers(self, address, count, access, **kwargs):
+        if access == 'holding':
+            return self.read_holding_registers(address, count, **kwargs)
+
+        if access == 'input':
+            return self.read_input_registers(address, count, **kwargs)
+
+        raise Exception('Invalid register access type: %s' % access)
+
+class TcpClient(ModbusExtras, ModbusTcpClient):
     method = 'tcp'
 
-class UdpClient(RefCount, ModbusUdpClient):
+class UdpClient(ModbusExtras, ModbusUdpClient):
     method = 'udp'
 
     @property
@@ -49,7 +58,7 @@ class UdpClient(RefCount, ModbusUdpClient):
         if self.socket:
             self.socket.settimeout(t)
 
-class SerialClient(RefCount, ModbusSerialClient):
+class SerialClient(ModbusExtras, ModbusSerialClient):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.lock = threading.RLock()

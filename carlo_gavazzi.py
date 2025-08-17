@@ -2,17 +2,13 @@ import device
 import probe
 from register import *
 
-class Reg_ver(Reg, int):
+class Reg_ver(Reg, str):
     def __init__(self, base, name):
-        super().__init__(base, 1, name, text='%d.%d.%d')
-
-    def __int__(self):
-        v = self.value
-        return v[0] << 16 | v[1] << 8 | v[2]
+        super().__init__(base, 1, name)
 
     def decode(self, values):
         v = values[0]
-        return self.update((v >> 12, v >> 8 & 0xf, v & 0xff))
+        return self.update('%d.%d.%d' % (v >> 12, v >> 8 & 0xf, v & 0xff))
 
 nr_phases = [ 3, 3, 2, 1, 3 ]
 
@@ -32,6 +28,8 @@ switch_positions = [
 ]
 
 class EM24_Meter(device.CustomName, device.EnergyMeter):
+    vendor_id = 'cg'
+    vendor_name = 'Carlo Gavazzi'
     productid = 0xb017
     productname = 'Carlo Gavazzi EM24 Ethernet Energy Meter'
     min_timeout = 0.5
@@ -90,9 +88,6 @@ class EM24_Meter(device.CustomName, device.EnergyMeter):
     def dbus_write_register(self, reg, path, val):
         super().dbus_write_register(reg, path, val)
         self.sched_reinit()
-
-    def get_ident(self):
-        return 'cg_%s' % self.info['/Serial']
 
 models = {
     1648: {
